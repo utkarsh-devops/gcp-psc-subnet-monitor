@@ -1,61 +1,75 @@
 import json
 import logging
+from google.auth import default, exceptions
 from google.cloud.logging import Client
 from google.cloud.logging_v2.resource import Resource
 
-# Configure logging client
-client = Client()
+# --- Project Configuration ---
+target_project_id = 'prj-t-600001687-hcf-reports'  
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.DEBUG)
+
+# --- Credential Management ---
+try:
+    credentials, _ = default()
+except exceptions.DefaultCredentialsError:
+    logging.warning("Default credentials not found. Logging may not work as expected.")
+    credentials = None
+client = Client(project=target_project_id, credentials=credentials)
 logger = client.logger('psc-subnet-monitoring')
 
-# Define descriptive keys for the list elements in your jsonPayload (if applicable)
+# --- Data Definitions ---
 keys = [
-    "folder_path",
-    "project_id",
-    "self_link",
-    "subnet_name",
-    "ip_range",
-    "min_num_ips",
-    "allocated_ips",
-    "reserved_ips",
-    "utilized_percent",
+    "folder_path", "project_id", "self_link", "subnet_name",
+    "ip_range", "min_num_ips", "allocated_ips", "reserved_ips",
+    "utilized_percent"
 ]
 
-# Custom Resource Labels - Modify to fit your environment
 resource = Resource(
-    type="gce_service_attachment",  
+    type="gce_service_attachment",
     labels={
         "logtag": "psc-subnet-monitor",
     },
 )
 
-# Read JSON log file
+# --- Log File Processing ---
 try:
     with open('service_attachments.json', 'r') as file:
         log_entries = json.load(file)
-except FileNotFoundError:
-    logger.log_text("Log file 'service_attachments.json' not found", severity="ERROR")
-except json.JSONDecodeError as e:
-    logger.log_text(f"Invalid JSON in file: {e}", severity="ERROR")
-except Exception as e:  # Catch any unexpected error
-    logger.log_text(f"Error reading log file: {e}", severity="ERROR")
+        logging.debug(f"Loaded {len(log_entries)} log entries from file")
+except (FileNotFoundError, json.JSONDecodeError, Exception) as e:
+    logging.error(f"Error reading log file: {e}")
+    exit(1) 
+
 else:
-    # Ingest log entries
     for entry in log_entries:
         try:
-            if isinstance(entry, list) and len(entry) == len(keys):
-                # Convert the list directly to a dictionary
-                payload_dict = dict(zip(keys, entry))
-                logger.log_struct({'jsonPayload': payload_dict}, resource=resource)
+            # Initialize payload_dict before the conditional blocks
+            payload_dict = None
 
+            if isinstance(entry, list) and len(entry) == len(keys):
+                payload_dict = dict(zip(keys, entry))
             elif isinstance(entry, dict) and all(key in entry for key in keys):
-                # If it's already a dictionary with the correct keys, log directly
-                logger.log_struct({'jsonPayload': entry}, resource=resource)
-                
+                payload_dict = entry
+
+            if payload_dict:  # Check if payload_dict was assigned
+                # Log the entry (with fallback for auth issues)
+                try:
+                    logger.log_struct({'jsonPayload': payload_dict}, resource=resource)
+                except exceptions.DefaultCredentialsError:
+                    logging.error("Authentication error. Logging to a basic logger.")
+                    logging.basicConfig(level=logging.ERROR) 
+                    logging.error(payload_dict)
+                else:
+                    source_project_id = payload_dict.get('project_id', 'Unknown Source Project')
+                    logging.info(f"Successfully shipped log from project {source_project_id} to project: {target_project_id}")
             else:
-                logger.log_text(
-                    f"Unexpected log entry format or length/key mismatch with keys: {entry}", 
-                    severity='WARNING'
+                logging.warning(
+                    f"Invalid log entry format or length/key mismatch with keys: {entry}. Skipping this entry."
                 )
 
         except (KeyError, TypeError) as e:
-            logger.log_text(f"Error processing log entry: {e}", severity='ERROR')
+            logging.error(f"Error processing log entry: {e}")
+
+print(f"Finished processing logs. Check project '{target_project_id}' in Cloud Logging.")
